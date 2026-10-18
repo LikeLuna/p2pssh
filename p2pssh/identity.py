@@ -3,10 +3,18 @@ import os
 import stat
 from pathlib import Path
 
+import base64
+import hashlib
+
 from cryptography.exceptions import UnsupportedAlgorithm
+
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 DEFAULT_DIR = Path.home() / ".p2pssh"
 PRIVATE_NAME = "id_ed25519"
 PUBLIC_NAME = "id_ed25519.pub"
@@ -29,6 +37,9 @@ class Identity:
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
+    def sign(self, data: bytes) -> bytes:
+        """Sign `data`; returns a 64-byte signature."""
+        return self.private_key.sign(data)   
 
 
 def _write_private(path: Path, key: Ed25519PrivateKey) -> None:
@@ -96,3 +107,26 @@ def load_or_create_identity(path: str = None) -> Identity:
     _write_private(private_path, key)
     _write_public(public_path, key)
     return Identity(key)
+PUBLIC_KEY_SIZE = 32
+SIGNATURE_SIZE = 64
+
+
+def fingerprint(pub: bytes) -> str:
+    """Readable ID of a public key, e.g. 'SHA256:x7Kq...' (same style as OpenSSH)."""
+    if len(pub) != PUBLIC_KEY_SIZE:
+        raise ValueError(f"public key must be {PUBLIC_KEY_SIZE} bytes, got {len(pub)}")
+    digest = hashlib.sha256(pub).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def verify(pub: bytes, data: bytes, sig: bytes) -> bool:
+    """True only if `sig` is a valid signature of `data` by `pub`. Never raises on bad signatures."""
+    if len(pub) != PUBLIC_KEY_SIZE:
+        raise ValueError(f"public key must be {PUBLIC_KEY_SIZE} bytes, got {len(pub)}")
+    if len(sig) != SIGNATURE_SIZE:
+        return False
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, data)
+    except InvalidSignature:
+        return False
+    return True
