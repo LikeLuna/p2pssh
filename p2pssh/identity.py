@@ -1,13 +1,19 @@
 """A.1: Identity management (owner: Member 1)."""
 import os
+import stat
 from pathlib import Path
 
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 DEFAULT_DIR = Path.home() / ".p2pssh"
 PRIVATE_NAME = "id_ed25519"
 PUBLIC_NAME = "id_ed25519.pub"
+
+
+class IdentityError(Exception):
+    """Raised when the identity key cannot be loaded safely."""
 
 
 class Identity:
@@ -46,6 +52,31 @@ def _write_public(path: Path, key: Ed25519PrivateKey) -> None:
     path.write_bytes(pem)
 
 
+def _check_permissions(path: Path) -> None:
+    """Refuse a private key that other users could read (like SSH)."""
+    if os.name == "nt":
+        return  # Windows permissions work differently; skip.
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        raise IdentityError(
+            f"Private key {path} has unsafe permissions ({oct(mode)}). "
+            f"Run: chmod 600 {path}"
+        )
+
+
+def _load_private(path: Path) -> Ed25519PrivateKey:
+    try:
+        key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        raise IdentityError(
+            f"Private key {path} is corrupted or encrypted. "
+            f"The file was NOT modified."
+        ) from exc
+    if not isinstance(key, Ed25519PrivateKey):
+        raise IdentityError(f"{path} is not an Ed25519 key. The file was NOT modified.")
+    return key
+
+
 def load_or_create_identity(path: str = None) -> Identity:
     """Load the identity from folder `path`, creating it on first run."""
     folder = Path(path) if path else DEFAULT_DIR
@@ -55,8 +86,10 @@ def load_or_create_identity(path: str = None) -> Identity:
     public_path = folder / PUBLIC_NAME
 
     if private_path.exists():
-        pem = private_path.read_bytes()
-        key = serialization.load_pem_private_key(pem, password=None)
+        _check_permissions(private_path)
+        key = _load_private(private_path)
+        if not public_path.exists():          # recreate a lost .pub file
+            _write_public(public_path, key)
         return Identity(key)
 
     key = Ed25519PrivateKey.generate()
