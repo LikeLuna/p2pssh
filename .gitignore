@@ -12,3 +12,5 @@ venv/
 *.key
 id_ed25519*
 known_peers.json
+A.md
+venv-wsl
