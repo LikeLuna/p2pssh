@@ -143,3 +143,9 @@ class Discovery:
             self._browser = None
         if self._own_zc:
             self._zc.close()
+def parse_hostport(text: str):
+    """'192.168.1.5:5000' -> ('192.168.1.5', 5000). Manual peer entry."""
+    host, sep, port = str(text).rpartition(":")
+    if not sep or not host or not port.isdigit() or not (1 <= int(port) <= 65535):
+        raise DiscoveryError("address must look like IP:port, e.g. 192.168.1.5:5000")
+    return host, int(port)

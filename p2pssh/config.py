@@ -6,6 +6,7 @@ Missing file -> defaults. Corrupt file -> backed up and defaults used (never cra
 import json
 import os
 import re
+import time
 import socket
 import tempfile
 from dataclasses import dataclass, asdict, fields
@@ -34,6 +35,7 @@ class Config:
     key_dir: str = ""          # folder passed to load_or_create_identity
     trust_path: str = ""       # file passed to TrustStore
     allow_self: bool = False   # allow connecting to our own node (testing only)
+    allow_shell: bool = False  # remote shell is OFF unless you turn it on
 
     def __post_init__(self):
         h = home_dir()
@@ -42,13 +44,15 @@ class Config:
         self.trust_path = self.trust_path or str(h / "known_peers.json")
 
     def validate(self) -> None:
-        if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
+        if not isinstance(self.name, str) or not _NAME_RE.fullmatch(self.name):
             raise ConfigError("name must be 1-32 chars of letters, digits, . _ -")
         if not isinstance(self.port, int) or isinstance(self.port, bool) \
                 or not (0 <= self.port <= 65535):
             raise ConfigError("port must be 0-65535")
-        if not isinstance(self.allow_self, bool):
-            raise ConfigError("allow_self must be true or false")
+        for f in ("allow_self", "allow_shell"):
+            if not isinstance(getattr(self, f), bool):
+                raise ConfigError(f"{f} must be true or false")
+        
         for f in ("key_dir", "trust_path"):
             if not isinstance(getattr(self, f), str) or not getattr(self, f):
                 raise ConfigError(f"{f} must be a non-empty string")
@@ -60,20 +64,24 @@ def config_path() -> Path:
 
 def load_config(path: Path = None) -> Config:
     path = Path(path) if path else config_path()
-    if not path.exists():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:                      # missing or unreadable: defaults, don't touch the file
         return Config()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("not an object")
-    except (ValueError, OSError):
-        path.replace(path.with_suffix(".json.bad"))  # keep the broken file
+        known = {f.name for f in fields(Config)}
+        cfg = Config(**{k: v for k, v in data.items() if k in known})
+        cfg.validate()
+        return cfg
+    except (ValueError, TypeError, ConfigError):
+        try:
+            path.replace(path.with_name(f"{path.name}.bad.{int(time.time())}"))
+        except OSError:
+            pass
         return Config()
-    known = {f.name for f in fields(Config)}
-    cfg = Config(**{k: v for k, v in data.items() if k in known})  # ignore unknown keys
-    cfg.validate()
-    return cfg
-
 
 def save_config(cfg: Config, path: Path = None) -> None:
     cfg.validate()

@@ -234,9 +234,9 @@ Message types, frame limits and error codes are in `constants.py` and `errors.py
 **Progress checklist** (tick when merged to `main` with passing tests)
 
 - [X] A.1 Identity + trust store (M1)
-- [ ] B.1 Discovery (M1)
-- [ ] C.1 Remote shell (M1)
-- [ ] CLI + config (M1)
+- [X] B.1 Discovery (M1)
+- [x] C.1 Remote shell (M1)
+- [X] CLI + config (M1)
 - [ ] A.2 Handshake (M2)
 - [ ] B.2 Transport (M2)
 - [ ] Chat (M2)
