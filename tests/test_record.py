@@ -1,7 +1,7 @@
 
 import pytest
 
-from record import RecordLayer, RecordError
+from p2pssh.record import RecordLayer, RecordError
 
 
 KEY = b"K" * 32
