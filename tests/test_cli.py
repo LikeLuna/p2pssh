@@ -53,3 +53,16 @@ def test_config_bad_values():
 
 def test_placeholders_return_2():
     assert main(["shell"]) == 2
+
+def test_shell_off_by_default(capsys):
+    assert main(["shell", "ben"]) == 1
+    assert "OFF" in capsys.readouterr().out
+
+def test_shell_needs_trusted_peer(capsys):
+    main(["config", "set", "allow_shell", "true"])
+    assert main(["shell", "ben"]) == 1
+    assert "not trusted" in capsys.readouterr().out
+
+def test_keygen_never_overwrites(capsys):
+    main(["keygen"]); main(["keygen"])
+    assert "already exists" in capsys.readouterr().out

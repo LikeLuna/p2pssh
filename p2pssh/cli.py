@@ -1,18 +1,20 @@
-"""C.2a - command-line entry point 
+"""C.2a - command-line entry point
 
 Usage:  python -m p2pssh.cli <command>
-Commands: whoami | peers | announce | trust list/add/remove | config show/set
-          connect | shell | chat   (placeholders until the handshake exists)
+Commands: whoami | fingerprint | keygen | peers | announce
+          trust list/add/remove | config show/set
+          listen | connect | chat | send | shell  (placeholders until the handshake exists)
 """
 import argparse
 import dataclasses
+import os
 import sys
 import time
+from pathlib import Path
 
-from p2pssh.config import (Config, ConfigError, config_path, load_config,
-                           save_config)
-from p2pssh.discovery import Discovery, DiscoveryError
-from p2pssh.identity import (IdentityError, TrustError, TrustStore,
+from p2pssh.config import (ConfigError, config_path, load_config, save_config)
+from p2pssh.discovery import Discovery, DiscoveryError, parse_hostport
+from p2pssh.identity import (PRIVATE_NAME, IdentityError, TrustError, TrustStore,
                              fingerprint, load_or_create_identity)
 
 
@@ -23,6 +25,20 @@ def cmd_whoami(args, cfg):
     print(f"public key:  {ident.public_bytes().hex()}")
     print(f"key folder:  {cfg.key_dir}")
     print(f"port:        {cfg.port or 'auto'}")
+    print(f"shell:       {'ON' if cfg.allow_shell else 'off'}")
+    return 0
+
+
+def cmd_keygen(args, cfg):
+    existed = (Path(cfg.key_dir) / PRIVATE_NAME).exists()
+    ident = load_or_create_identity(cfg.key_dir)
+    print("key already exists (not changed)" if existed else "new key created")
+    print(f"fingerprint: {fingerprint(ident.public_bytes())}")
+    return 0
+
+
+def cmd_fingerprint(args, cfg):
+    print(fingerprint(load_or_create_identity(cfg.key_dir).public_bytes()))
     return 0
 
 
@@ -77,10 +93,9 @@ def cmd_trust(args, cfg):
         except ValueError:
             print("error: public key must be hex")
             return 1
-        if(len(pub)!=32):
+        if len(pub) != 32:
             print("error: public key must be 32 bytes (64 hex characters)")
             return 1
-        
         store.add(args.name, pub)
         print(f"trusted '{args.name}' ({fingerprint(pub)})")
     elif args.action == "remove":
@@ -98,8 +113,8 @@ def cmd_config(args, cfg):
         for k, v in dataclasses.asdict(cfg).items():
             print(f"{k:<12} {v}")
         return 0
-    if args.key not in ("name", "port", "allow_self") or args.value is None:
-        print("error: usage: config set <name|port|allow_self> <value>")
+    if args.key not in ("name", "port", "allow_self", "allow_shell") or args.value is None:
+        print("error: usage: config set <name|port|allow_self|allow_shell> <value>")
         return 1
     if args.key == "port":
         try:
@@ -107,9 +122,9 @@ def cmd_config(args, cfg):
         except ValueError:
             print("error: port must be a number")
             return 1
-    elif args.key == "allow_self":
+    elif args.key in ("allow_self", "allow_shell"):
         if args.value.lower() not in ("true", "false"):
-            print("error: allow_self must be true or false")
+            print(f"error: {args.key} must be true or false")
             return 1
         value = args.value.lower() == "true"
     else:
@@ -120,6 +135,22 @@ def cmd_config(args, cfg):
 
 
 def cmd_not_ready(args, cfg):
+    """listen / connect / chat / send / shell: input is checked now,
+    the real work is wired in at integration (needs handshake + session)."""
+    target = getattr(args, "target", None)
+    if args.command == "shell" and target and not cfg.allow_shell:
+        print("error: remote shell is OFF. Enable with: config set allow_shell true")
+        return 1
+    if target:
+        if ":" in target:
+            parse_hostport(target)                      # raises DiscoveryError if bad
+        elif args.command == "shell" and target not in TrustStore(cfg.trust_path).list_peers():
+            print(f"error: '{target}' is not trusted. Use: trust add {target} <pubkey>")
+            return 1
+    path = getattr(args, "path", None)
+    if args.command == "send" and path and not os.path.isfile(path):
+        print(f"error: file not found: {path}")
+        return 1
     print(f"'{args.command}' is not available yet (needs the handshake from Member 2).")
     return 2
 
@@ -129,6 +160,8 @@ def build_parser():
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("whoami", help="show my name and fingerprint").set_defaults(func=cmd_whoami)
+    sub.add_parser("keygen", help="create my key (never overwrites)").set_defaults(func=cmd_keygen)
+    sub.add_parser("fingerprint", help="print my fingerprint").set_defaults(func=cmd_fingerprint)
 
     sp = sub.add_parser("peers", help="list peers found on the LAN")
     sp.add_argument("--wait", type=float, default=3.0, help="seconds to listen")
@@ -148,8 +181,19 @@ def build_parser():
     sp.add_argument("value", nargs="?")
     sp.set_defaults(func=cmd_config)
 
-    for name in ("connect", "shell", "chat"):
-        sub.add_parser(name, help="(needs handshake)").set_defaults(func=cmd_not_ready)
+    sp = sub.add_parser("listen", help="accept connections (needs handshake)")
+    sp.add_argument("--port", type=int)
+    sp.set_defaults(func=cmd_not_ready)
+
+    for name in ("connect", "chat", "shell"):
+        sp = sub.add_parser(name, help="peer name or IP:port (needs handshake)")
+        sp.add_argument("target", nargs="?")
+        sp.set_defaults(func=cmd_not_ready)
+
+    sp = sub.add_parser("send", help="send a file (needs handshake)")
+    sp.add_argument("target", nargs="?")
+    sp.add_argument("path", nargs="?")
+    sp.set_defaults(func=cmd_not_ready)
     return p
 
 

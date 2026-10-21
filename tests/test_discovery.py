@@ -69,3 +69,11 @@ def test_two_nodes_find_each_other_on_lan():
         assert b.peers()[0].name == "asha" and b.peers()[0].port == 5001
     finally:
         a.close(); b.close()
+
+def test_bad_hostport_rejected():
+    import pytest
+    from p2pssh.discovery import parse_hostport, DiscoveryError
+    assert parse_hostport("10.0.0.5:5000") == ("10.0.0.5", 5000)
+    for bad in ("10.0.0.5", ":80", "h:0", "h:99999", "h:abc"):
+        with pytest.raises(DiscoveryError):
+            parse_hostport(bad)
