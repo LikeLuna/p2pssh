@@ -6,3 +6,6 @@ class FrameError(P2PSSHError):
 
 class ConnectionClosed(P2PSSHError):
     """Peer disconnected or connection already closed."""
+
+class ConnTimeout(P2PSSHError):
+    """No data arrived within the allowed time."""
