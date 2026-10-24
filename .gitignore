@@ -4,7 +4,7 @@ pssh/
 *.key
 id_ed25519*
 known_peers.json
-
+*.egg-info/
 pssh/
 __pycache__/
 venv/

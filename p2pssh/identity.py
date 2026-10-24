@@ -256,3 +256,28 @@ class TrustStore:
             for name, entry in data.items()
             if isinstance(entry, dict)
         }
+    def find_by_fingerprint(self, fp: str):
+        """ Return the name of the trusted peer whose key has fingerprint `fp`, or None.
+
+            Used by the handshake responder, which receives the client's key but not
+            a trustworthy name. The fingerprint is recomputed from the stored key, so
+            a damaged or edited `fingerprint` field in the file cannot fool the lookup.
+            If two names share one key, the alphabetically first name is returned."""
+   
+
+        if not isinstance(fp, str) or not fp:
+            raise ValueError("fingerprint must be a non-empty string")
+        with self._lock:
+            data = self._load()
+        for name in sorted(n for n in data if isinstance(n, str)):
+            entry = data[name]
+            try:
+                stored = base64.b64decode(entry["pubkey_b64"], validate=True)
+                if len(stored) != PUBLIC_KEY_SIZE:
+                    continue
+                candidate = fingerprint(stored)
+            except (KeyError, TypeError, ValueError):
+                continue                      # malformed entry: never matches
+            if hmac.compare_digest(candidate.encode(), fp.encode()):
+                return name
+        return None
