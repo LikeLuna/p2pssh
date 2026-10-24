@@ -1,8 +1,8 @@
 # p2pssh Handshake Protocol (v1)
 
-**Status:** DRAFT for Week-1 review. Owner: A.2 (Member 2). Reviewers: Member 1 (identity / trust store), Member 3 (record layer).
+**Status:** v1, contract decisions recorded (2026-10-23). Owner: A.2 (Member 2). Reviewed by Member 1 (identity / trust store); Member 3 (record layer) to confirm AES-256-GCM (section 10, decision 2).
 **Source of truth for the frozen contract:** project plan, section 4.1 (framing), 4.2 (handshake), 4.6 (error codes).
-This document does **not** change any frozen byte layout. Where the plan leaves something open, it is listed in section 10 (Open questions) so we can decide it together.
+Wire message sizes (97 / 161 / 64 bytes) are unchanged. The only change to the frozen plan is the role prefix on the signed data (section 3.2), agreed in the review of the first draft. All decisions are recorded in section 10.
 
 ---
 
@@ -86,10 +86,17 @@ H1 = SHA256( CH || SH_nosig )      # signed by the server
 H2 = SHA256( CH || SH )            # signed by the client (covers the server signature too)
 ```
 
-- `sig_server = Ed25519.sign(server_id_priv, H1)`
-- `sig_client = Ed25519.sign(client_id_priv, H2)`
+Signed data carries a role-specific, fixed 16-byte prefix (domain separation):
 
-Because H1 and H2 are different values, a signature produced by one role can never be accepted as the other role's signature (this is what stops reflection of signatures).
+```
+PREFIX_SERVER = b"p2pssh v1 server"     # 16 bytes
+PREFIX_CLIENT = b"p2pssh v1 client"     # 16 bytes
+
+sig_server = Ed25519.sign(server_id_priv, PREFIX_SERVER || H1)    # signs 48 bytes
+sig_client = Ed25519.sign(client_id_priv, PREFIX_CLIENT || H2)    # signs 48 bytes
+```
+
+The prefix is **not** sent on the wire, so message sizes do not change. Verification rebuilds the same 48 bytes. The prefix and the fact that H1 and H2 are different values together mean a signature made for one role or one protocol can never be accepted as the other role's signature (this is what stops reflection and cross-context reuse of signatures). `Identity.sign()` / `verify()` (A.1) work on arbitrary bytes, so no change is needed there.
 
 ## 4. Key derivation
 
@@ -109,6 +116,8 @@ session_id = H2[0:16]       # 16 bytes, for logging / correlation only; not secr
 
 The result is returned as `SessionKeys(send_key, recv_key, peer_pub, peer_fingerprint, session_id)` and handed to `RecordLayer(send_key, recv_key)` (A.3).
 
+**Record-layer cipher:** AES-256-GCM (decision 2 in section 10; the original plan text said ChaCha20-Poly1305). The handshake only outputs two independent 32-byte keys, so it does not depend on the cipher choice. Both ciphers use a 12-byte nonce, so the plan's nonce format (4 zero bytes + 8-byte counter) is unchanged.
+
 **Low-order points:** if `X25519()` raises, or if `shared` is 32 zero bytes, abort with `E_AUTH`.
 
 **Cleanup:** after deriving, drop references to the ephemeral private key and to `shared` (best effort in Python). Do not log keys, `shared`, or the private identity key.
@@ -120,7 +129,7 @@ Receiver of any handshake message, in this order:
 1. **Length** is exactly the expected size, else `E_PROTOCOL`.
 2. **Message order** is correct (ClientHello, then ServerHello, then ClientAuth), else `E_PROTOCOL`.
 3. **Version** byte equals `0x01`, else `E_VERSION`.
-4. **Reflection checks** (section 6).
+4. **Reflection / self-connect checks** (section 6). These run before any trust prompt.
 5. **Signature** verifies with the `*_id_pub` that is *inside the same hello*, else `E_AUTH`.
 6. **X25519** succeeds and is not all-zero (section 4), else `E_AUTH`.
 7. **TrustStore** (only after the signature is valid; never trust an unsigned key):
@@ -133,6 +142,10 @@ Receiver of any handshake message, in this order:
 
 Signature check always happens before the trust prompt so a user is never asked about a key that the peer cannot prove it owns.
 
+**Peer name for `TrustStore.check(name, pub)` (decision 1):** the name is only a label; the public-key fingerprint is the identity, and `TrustStore` decisions rest on the key, not on the name alone.
+- *Initiator:* uses `conn.peer_name`, set by `Node.dial()` to the discovery name, or `"host:port"` when the user gave an address.
+- *Responder:* the connecting client has no stable name (its source port is random), so the responder looks the client up by the client's fingerprint string (`"SHA256:..."`). Consequence: on the responder side an unknown key is always `NEW` (there is no per-name `CHANGED`). This is the same as an allow-list of fingerprints. **To be confirmed with Member 1.**
+
 ## 6. Attack analysis and defenses
 
 | Attack | Defense |
@@ -141,7 +154,7 @@ Signature check always happens before the trust prompt so a user is never asked 
 | **Active MITM swapping ephemeral keys** | Both ephemeral keys are inside the signed transcript, so the swap changes H1/H2 and the signature fails (`E_AUTH`) |
 | **MITM substituting identity key** | Signature verifies only with the attacker's own key, which the TrustStore reports as `NEW` (user prompt) or `CHANGED` (abort) |
 | **Replay of an old ServerHello / ClientAuth** | Both sides contribute a fresh nonce. An old signature is over a different transcript and fails |
-| **Reflection** (attacker bounces our own ClientHello back at us) | Initiator rejects a ServerHello whose `server_eph_pub`, `server_nonce` or `server_id_pub` equals its own. Responder rejects a ClientHello whose `client_nonce` equals the one it already generated. Signatures are role-asymmetric (H1 vs H2) |
+| **Reflection** (attacker bounces our own ClientHello back at us) | Initiator rejects a ServerHello whose `server_eph_pub`, `server_nonce` or `server_id_pub` equals its own. Connecting to your own node (`server_id_pub` equals own identity) is rejected unless `allow_self=True` (CLI: `--allow-self`, for local testing only); every other check still runs in that mode. Responder rejects a ClientHello whose `client_nonce` equals the one it already generated. Signatures are role-asymmetric (H1 vs H2) |
 | **Downgrade** | Single version `0x01`; unknown version is a hard fail with `E_VERSION`. No algorithm negotiation exists, so nothing to downgrade |
 | **Truncated / oversized / garbage message** | Exact length checks; frame limit 64 KiB enforced by B.2; any parse problem is `E_PROTOCOL` with no stack trace leaked to the peer |
 | **Slowloris at handshake** | Overall handshake deadline 10 s (`HANDSHAKE_TIMEOUT`), then `E_TIMEOUT` and the socket is closed |
@@ -169,8 +182,10 @@ On any failure the implementation raises `HandshakeError(code, message)` locally
 
 ```python
 async def perform_handshake(conn: Connection, identity: Identity,
-                            trust: TrustStore, role: str) -> SessionKeys
+                            trust: TrustStore, role: str,
+                            allow_self: bool = False) -> SessionKeys
 # role in {"initiator", "responder"}; raises HandshakeError
+# allow_self is an optional keyword with a default, so the frozen 4-argument call still works
 ```
 
 ```python
@@ -189,12 +204,14 @@ Normal (A2-N1..N6): keys match crosswise, keys differ every connection, NEW acce
 Boundary / attack (A2-B1..B14): MITM swap, bit-flipped signature, truncated message, wrong order, wrong version, timeout, zero shared secret, close mid-handshake, reflection, replayed ServerHello, signer key differs from hello key.
 Run first against `tests/stubs.py` (in-memory queues), then over real TCP with B.2.
 
-## 10. Open questions (decide at the Week-1 contract review)
+## 10. Decisions (resolved from the review of the first draft)
 
-1. **How does the handshake know the peer's *name* for `TrustStore.check(peer_name, pub)`?** The frozen interface has no `peer_name` argument. Proposal: `Node.dial()` sets `conn.peer_name` (discovery name or `"host:port"`), and the responder uses the claimed peer's fingerprint string as the lookup key. Needs agreement with Member 1.
-2. **Cipher in A.3.** Plan 4.3 says ChaCha20-Poly1305; the current `record.py` uses AES-GCM. Pick one and update either the code or the plan. The handshake does not care, as it only outputs two 32-byte keys.
-3. **Optional hardening:** add a domain-separation prefix such as `b"p2pssh v1 server"` / `b"p2pssh v1 client"` to the signed data. This would change the frozen signature input, so it needs everyone's approval; v1 is safe without it because H1 != H2.
-4. **Self-connect:** should connecting to your own node be allowed (useful for local testing) or rejected as reflection?
+| # | Question | Decision |
+|---|---|---|
+| 1 | Peer name for `TrustStore.check(name, pub)` | `Node.dial()` sets `conn.peer_name` (discovery name, or `"host:port"` for a direct address). The name is a label, the key fingerprint is the identity. Responder side looks up the client by fingerprint (section 5). Responder lookup still to be confirmed with Member 1 |
+| 2 | Record-layer cipher | **AES-256-GCM**, matching the merged `record.py`. Awaiting explicit confirmation from Member 3. The project plan text and the report must be updated from ChaCha20-Poly1305 |
+| 3 | Domain separation in signed data | **Adopted.** Signed bytes are `PREFIX || H` with the 16-byte prefixes in section 3.2. Not sent on the wire |
+| 4 | Self-connect | **Rejected by default.** Allowed only with `allow_self=True` / `--allow-self`; no other check is skipped |
 
 ## Appendix A. Reference computation (for test vectors)
 
@@ -203,6 +220,10 @@ import hashlib, os
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+# signing (see section 3.2)
+sig_server = server_id_priv.sign(b"p2pssh v1 server" + H1)
+sig_client = client_id_priv.sign(b"p2pssh v1 client" + H2)
 
 salt = hashlib.sha256(client_nonce + server_nonce).digest()
 shared = my_eph_priv.exchange(peer_eph_pub)
