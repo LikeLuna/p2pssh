@@ -163,7 +163,7 @@ def build_parser():
     sub.add_parser("keygen", help="create my key (never overwrites)").set_defaults(func=cmd_keygen)
     sub.add_parser("fingerprint", help="print my fingerprint").set_defaults(func=cmd_fingerprint)
 
-    sp = sub.add_parser("peers", help="list peers found on the LAN")
+    sp = sub.add_parser("peers", aliases=["find"], help="list peers found on the LAN")
     sp.add_argument("--wait", type=float, default=3.0, help="seconds to listen")
     sp.set_defaults(func=cmd_peers)
 
