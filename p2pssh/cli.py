@@ -96,7 +96,11 @@ def cmd_trust(args, cfg):
         if len(pub) != 32:
             print("error: public key must be 32 bytes (64 hex characters)")
             return 1
-        store.add(args.name, pub)
+        try:
+            store.add(args.name, pub)
+        except TrustError as exc:
+            print(f"error: {exc}")
+            return 1
         print(f"trusted '{args.name}' ({fingerprint(pub)})")
     elif args.action == "remove":
         if not args.name:
