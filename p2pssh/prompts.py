@@ -69,10 +69,10 @@ def new_peer_text(name, fp: str) -> str:
         "Only trust it if it matches exactly.",
     ])
 
-
-def confirm_new_peer(name, pub: bytes, *, ask=input, out=_default_out) -> bool:
-    """Show the fingerprint and ask yes/no. Anything except a clear yes is a no."""
-    out(new_peer_text(name, fingerprint(pub)))
+def confirm_fingerprint(name, fp: str, *, ask=input, out=_default_out) -> bool:
+    """Show a fingerprint STRING and ask yes/no. Anything except a clear yes is a no.
+    (The handshake's confirm callback only has the fingerprint string, not the key.)"""
+    out(new_peer_text(name, fp))
     for _ in range(MAX_ATTEMPTS):
         try:
             answer = ask("Trust this peer? (yes/no): ")
@@ -88,6 +88,9 @@ def confirm_new_peer(name, pub: bytes, *, ask=input, out=_default_out) -> bool:
     out("No valid answer, peer not trusted.")
     return False
 
+
+def confirm_new_peer(name, pub: bytes, *, ask=input, out=_default_out) -> bool:
+    return confirm_fingerprint(name, fingerprint(pub), ask=ask, out=out)
 
 def decide_initiator(trust, peer_name: str, pub: bytes, *, ask=input, out=_default_out):
     """We dialed a peer we know by name. Called after the signature was verified."""
