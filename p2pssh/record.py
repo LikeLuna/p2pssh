@@ -11,37 +11,52 @@ class RecordError(Exception):
 
 class RecordLayer:
     """
-    Encrypts and authenticates records.
-    Each direction must have its own key and nonce prefix.
+    AES-256-GCM record layer.
+
+    Uses separate keys for sending and receiving.
+
+    Wire format:
+        8-byte sequence number + ciphertext + 16-byte GCM tag.
+
+    Nonce:
+        4-byte zero prefix + 8-byte sequence number.
+
+    Each direction has a separate handshake-derived key.
     """
 
     MAX_SEQUENCE = (1 << 64) - 1
 
-    def __init__(self, key: bytes, nonce_prefix: bytes):
-        if len(key) != 32:
-            raise ValueError("AES-256-GCM requires a 32-byte key")
+    SEQUENCE_SIZE = 8
+    NONCE_PREFIX = b"\x00\x00\x00\x00"
+    TAG_SIZE = 16
 
-        if len(nonce_prefix) != 4:
-            raise ValueError("Nonce prefix must be exactly 4 bytes")
+    def __init__(self, send_key: bytes, recv_key: bytes):
+        if not isinstance(send_key, bytes) or len(send_key) != 32:
+            raise ValueError("send_key must be exactly 32 bytes")
 
-        self.aes = AESGCM(key)
-        self.nonce_prefix = nonce_prefix
+        if not isinstance(recv_key, bytes) or len(recv_key) != 32:
+            raise ValueError("recv_key must be exactly 32 bytes")
+
+        self.send_aes = AESGCM(send_key)
+        self.recv_aes = AESGCM(recv_key)
+
         self.send_sequence = 0
         self.recv_sequence = 0
 
     def seal(self, plaintext: bytes) -> bytes:
-        """Encrypt one message and add its sequence number."""
+        """Encrypt and authenticate one outgoing record."""
+
         if not isinstance(plaintext, bytes):
             raise TypeError("plaintext must be bytes")
 
         if self.send_sequence > self.MAX_SEQUENCE:
-            raise RecordError("Sequence number exhausted")
+            raise RecordError("Send sequence number exhausted")
 
         sequence = struct.pack("!Q", self.send_sequence)
-        nonce = self.nonce_prefix + sequence
 
-        # Sequence number is authenticated, but not encrypted.
-        ciphertext = self.aes.encrypt(
+        nonce = self.NONCE_PREFIX + sequence
+
+        ciphertext = self.send_aes.encrypt(
             nonce,
             plaintext,
             sequence,
@@ -49,37 +64,44 @@ class RecordLayer:
 
         self.send_sequence += 1
 
-        # Wire format: 8-byte sequence + ciphertext + GCM tag
         return sequence + ciphertext
 
     def open(self, record: bytes) -> bytes:
-        """Verify and decrypt one record in strict sequence order."""
-        if len(record) < 8 + 16:
+        """Authenticate and decrypt one incoming record."""
+
+        if not isinstance(record, bytes):
+            raise TypeError("record must be bytes")
+
+        if len(record) < self.SEQUENCE_SIZE + self.TAG_SIZE:
             raise RecordError("Record is too short")
 
-        sequence = record[:8]
-        received_number = struct.unpack("!Q", sequence)[0]
+        sequence = record[:self.SEQUENCE_SIZE]
 
-        if received_number != self.recv_sequence:
+        received_sequence = struct.unpack("!Q", sequence)[0]
+
+        if received_sequence != self.recv_sequence:
             raise RecordError(
                 f"Unexpected sequence: expected {self.recv_sequence}, "
-                f"got {received_number}"
+                f"got {received_sequence}"
             )
 
-        nonce = self.nonce_prefix + sequence
-        ciphertext = record[8:]
+        nonce = self.NONCE_PREFIX + sequence
+
+        ciphertext = record[self.SEQUENCE_SIZE:]
 
         try:
-            plaintext = self.aes.decrypt(
+            plaintext = self.recv_aes.decrypt(
                 nonce,
                 ciphertext,
                 sequence,
             )
+
         except InvalidTag as exc:
             raise RecordError(
                 "Authentication failed: record may be modified"
             ) from exc
 
-        # Advance only after successful authentication.
+        # Increment only after successful authentication.
         self.recv_sequence += 1
+
         return plaintext

@@ -1,75 +1,115 @@
 
-import socket
-import struct
-import threading
+import asyncio
 
-from record import RecordLayer
+from .record import RecordLayer, RecordError
 
 
 class SessionError(Exception):
-    """Raised when a session cannot safely continue."""
+    """Raised when a secure session cannot safely continue."""
 
 
-class Session:
-    MAX_RECORD_SIZE = 16 * 1024 * 1024  # 16 MiB
+class SecureSession:
+    """Asynchronous encrypted session over a frame connection."""
 
-    def __init__(
-        self,
-        sock: socket.socket,
-        send_key: bytes,
-        recv_key: bytes,
-        send_nonce_prefix: bytes,
-        recv_nonce_prefix: bytes,
-    ):
-        self.sock = sock
+    MAX_RECORD_SIZE = 16 * 1024
+    MIN_RECORD_SIZE = 8 + 16
 
-        self.sender = RecordLayer(send_key, send_nonce_prefix)
-        self.receiver = RecordLayer(recv_key, recv_nonce_prefix)
+    def __init__(self, conn, keys):
+        self.conn = conn
 
-        self.send_lock = threading.Lock()
-        self.recv_lock = threading.Lock()
+        self.record_layer = RecordLayer(
+            send_key=keys.send_key,
+            recv_key=keys.recv_key,
+        )
 
-    def send(self, data: bytes) -> None:
-        """Encrypt data and send one length-prefixed record."""
+        self.send_lock = asyncio.Lock()
+        self.recv_lock = asyncio.Lock()
+        self.closed = False
+
+    async def send(self, data: bytes) -> None:
+        """Encrypt and send one record."""
+
+        if self.closed:
+            raise SessionError("Session is closed")
+
         if not isinstance(data, bytes):
-            raise TypeError("Session.send() accepts bytes only")
+            raise TypeError("SecureSession.send() accepts bytes only")
 
-        with self.send_lock:
-            record = self.sender.seal(data)
+        max_plaintext = self.MAX_RECORD_SIZE - self.MIN_RECORD_SIZE
 
-            if len(record) > self.MAX_RECORD_SIZE:
-                raise SessionError("Record is too large")
+        if len(data) > max_plaintext:
+            raise SessionError(
+                f"Maximum plaintext size is {max_plaintext} bytes"
+            )
 
-            frame = struct.pack("!I", len(record)) + record
-            self.sock.sendall(frame)
+        async with self.send_lock:
+            if self.closed:
+                raise SessionError("Session is closed")
 
-    def _recv_exact(self, size: int) -> bytes:
-        """Read exactly size bytes or fail if the peer disconnects."""
-        chunks = []
-        remaining = size
+            try:
+                record = self.record_layer.seal(data)
+                await self.conn.send_frame(record)
 
-        while remaining > 0:
-            chunk = self.sock.recv(remaining)
+            except asyncio.CancelledError:
+                await self.close()
+                raise
 
-            if not chunk:
-                raise ConnectionError("Peer disconnected")
+            except Exception as exc:
+                await self.close()
+                raise SessionError("Failed to send secure record") from exc
 
-            chunks.append(chunk)
-            remaining -= len(chunk)
+    async def recv(self) -> bytes:
+        """Receive and authenticate one encrypted record."""
 
-        return b"".join(chunks)
+        if self.closed:
+            raise SessionError("Session is closed")
 
-    def recv(self) -> bytes:
-        """Receive one complete record, then authenticate and decrypt it."""
-        with self.recv_lock:
-            header = self._recv_exact(4)
-            record_size = struct.unpack("!I", header)[0]
+        async with self.recv_lock:
+            if self.closed:
+                raise SessionError("Session is closed")
 
-            if record_size < 24 or record_size > self.MAX_RECORD_SIZE:
-                raise SessionError("Invalid record length")
+            try:
+                record = await self.conn.recv_frame()
 
-            record = self._recv_exact(record_size)
-            return self.receiver.open(record)
+                if not isinstance(record, bytes):
+                    raise SessionError("Received frame must be bytes")
 
-    def close(self) -> None:
-        self.sock.close()
+                if not (
+                    self.MIN_RECORD_SIZE
+                    <= len(record)
+                    <= self.MAX_RECORD_SIZE
+                ):
+                    raise SessionError("Invalid record length")
+
+                return self.record_layer.open(record)
+
+            except asyncio.CancelledError:
+                await self.close()
+                raise
+
+            except RecordError as exc:
+                await self.close()
+                raise SessionError(
+                    "Record authentication or sequence validation failed"
+                ) from exc
+
+            except SessionError:
+                await self.close()
+                raise
+
+            except Exception as exc:
+                await self.close()
+                raise SessionError("Failed to receive secure record") from exc
+
+    async def close(self) -> None:
+        """Close the underlying connection."""
+
+        if self.closed:
+            return
+
+        self.closed = True
+
+        try:
+            await self.conn.close()
+        except Exception:
+            pass
