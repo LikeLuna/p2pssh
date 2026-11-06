@@ -1,65 +1,106 @@
-"""A.1: Identity management (owner: Member 1)."""
-import os
-from pathlib import Path
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+"""Reusable asynchronous test doubles for P2PSSH."""
 
-DEFAULT_DIR = Path.home() / ".p2pssh"
-PRIVATE_NAME = "id_ed25519"
-PUBLIC_NAME = "id_ed25519.pub"
+import asyncio
 
 
-class Identity:
-    """A node's permanent ID card: one Ed25519 key pair."""
+class StubConnection:
+    """In-memory replacement for transport.Connection."""
 
-    def __init__(self, private_key: Ed25519PrivateKey):
-        self.private_key = private_key
-        self.public_key = private_key.public_key()
+    def __init__(self, incoming=None, outgoing=None, peer_name=None):
+        self.incoming = incoming if incoming is not None else asyncio.Queue()
+        self.outgoing = outgoing if outgoing is not None else asyncio.Queue()
+        self.peer_name = peer_name
+        self.closed = False
 
-    def public_bytes(self) -> bytes:
-        """The 32 raw bytes of the public key."""
-        return self.public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
+    async def send_frame(self, data: bytes) -> None:
+        if self.closed:
+            raise RuntimeError("Connection is closed")
+
+        if not isinstance(data, bytes):
+            raise TypeError("Frame must be bytes")
+
+        await self.outgoing.put(data)
+
+    async def recv_frame(self, timeout=None) -> bytes:
+        if self.closed:
+            raise RuntimeError("Connection is closed")
+
+        try:
+            if timeout is None:
+                data = await self.incoming.get()
+            else:
+                data = await asyncio.wait_for(
+                    self.incoming.get(), timeout
+                )
+        except asyncio.TimeoutError:
+            await self.close()
+            raise
+
+        if data is None:
+            self.closed = True
+            raise RuntimeError("Peer disconnected")
+
+        return data
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            await self.outgoing.put(None)
+
+    @classmethod
+    def pair(cls):
+        """Create two connected in-memory connections."""
+        a_to_b = asyncio.Queue()
+        b_to_a = asyncio.Queue()
+
+        a = cls(incoming=b_to_a, outgoing=a_to_b)
+        b = cls(incoming=a_to_b, outgoing=b_to_a)
+
+        return a, b
 
 
-def _write_private(path: Path, key: Ed25519PrivateKey) -> None:
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    # O_EXCL: fail instead of overwriting an existing key.
-    # 0o600: owner read/write only (ignored on native Windows).
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(pem)
+class StubSession:
+    """In-memory replacement for SecureSession."""
 
+    def __init__(self, incoming=None, outgoing=None):
+        self.incoming = incoming if incoming is not None else asyncio.Queue()
+        self.outgoing = outgoing if outgoing is not None else asyncio.Queue()
+        self.closed = False
 
-def _write_public(path: Path, key: Ed25519PrivateKey) -> None:
-    pem = key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    path.write_bytes(pem)
+    async def send(self, data: bytes) -> None:
+        if self.closed:
+            raise RuntimeError("Session is closed")
 
+        if not isinstance(data, bytes):
+            raise TypeError("Message must be bytes")
 
-def load_or_create_identity(path: str = None) -> Identity:
-    """Load the identity from folder `path`, creating it on first run."""
-    folder = Path(path) if path else DEFAULT_DIR
-    folder.mkdir(parents=True, exist_ok=True)
+        await self.outgoing.put(data)
 
-    private_path = folder / PRIVATE_NAME
-    public_path = folder / PUBLIC_NAME
+    async def recv(self) -> bytes:
+        if self.closed:
+            raise RuntimeError("Session is closed")
 
-    if private_path.exists():
-        pem = private_path.read_bytes()
-        key = serialization.load_pem_private_key(pem, password=None)
-        return Identity(key)
+        data = await self.incoming.get()
 
-    key = Ed25519PrivateKey.generate()
-    _write_private(private_path, key)
-    _write_public(public_path, key)
-    return Identity(key)
+        if data is None:
+            self.closed = True
+            raise RuntimeError("Peer disconnected")
+
+        return data
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            await self.outgoing.put(None)
+
+    @classmethod
+    def pair(cls):
+        """Create two connected in-memory sessions."""
+        a_to_b = asyncio.Queue()
+        b_to_a = asyncio.Queue()
+
+        a = cls(incoming=b_to_a, outgoing=a_to_b)
+        b = cls(incoming=a_to_b, outgoing=b_to_a)
+
+        return a, b
