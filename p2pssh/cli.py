@@ -1,9 +1,9 @@
 """C.2a - command-line entry point
 
 Usage:  python -m p2pssh.cli <command>
-Commands: whoami | fingerprint | keygen | peers | announce
+Commands: whoami | fingerprint | keygen | peers (find) | announce
           trust list/add/remove | config show/set
-          listen | connect | chat | send | shell  (placeholders until the handshake exists)
+          listen | connect | chat | send | shell
 """
 import argparse
 import dataclasses
@@ -19,8 +19,17 @@ from p2pssh.handshake import perform_handshake
 from p2pssh.discovery import Discovery, DiscoveryError, parse_hostport
 from p2pssh.identity import (PRIVATE_NAME, IdentityError, TrustError, TrustStore,
                              fingerprint, load_or_create_identity)
+from p2pssh.files import FileTransferError, receive_file, send_file
 from p2pssh.prompts import clean_text, confirm_fingerprint
+from p2pssh.services import (SERVICE_CHAT, SERVICE_FILE, SERVICE_SHELL, make_authorizer,
+                             request_service, serve_service)
+from p2pssh.session import SecureSession, SessionError
+from p2pssh.shell import ShellError, pty_available, run_shell_client, serve_shell
 from p2pssh.transport import Node
+
+# Everything a command can raise while talking to a peer; shown as "error: ...", never a traceback.
+_RUNTIME_ERRORS = (P2PSSHError, SessionError, FileTransferError, ShellError, OSError)
+
 
 def cmd_whoami(args, cfg):
     ident = load_or_create_identity(cfg.key_dir)
@@ -140,6 +149,8 @@ def cmd_config(args, cfg):
     save_config(dataclasses.replace(cfg, **{args.key: value}))
     print(f"{args.key} = {value}")
     return 0
+
+
 # ---------------------------------------------------------------- listen / connect
 async def _confirm(fp, name):
     """Handshake callback for NEW peers. input() runs in a thread so the event loop stays alive."""
@@ -147,10 +158,42 @@ async def _confirm(fp, name):
     return await loop.run_in_executor(None, lambda: confirm_fingerprint(name, fp))
 
 
-async def _after_handshake(conn, keys, cfg, role):
-    """Hook: runs once the secure keys exist. chat / send / shell plug in here later
-    (needs M3's SecureSession(conn, keys) and M2's chat.py)."""
-    print(f"secure channel established ({role}) with {keys.peer_fingerprint}")
+def _load_chat():
+    """chat.py (Member 2) must expose  async def run_chat(session). None until it exists."""
+    try:
+        from p2pssh.chat import run_chat
+    except ImportError:
+        return None
+    return run_chat
+
+
+def _host_handlers(cfg):
+    """What this host offers to peers that connect to it."""
+    async def file_handler(session):
+        dest = Path(cfg.key_dir) / "downloads"
+        dest.mkdir(parents=True, exist_ok=True)
+        path = await receive_file(session, dest)
+        print(f"received file: {path}")
+
+    handlers = {SERVICE_FILE: file_handler, SERVICE_SHELL: serve_shell}
+    chat = _load_chat()
+    if chat is not None:
+        handlers[SERVICE_CHAT] = chat
+    return handlers
+
+
+def _host_authorizer(cfg, trust, peer_fingerprint):
+    """Host-side permission check: the shell needs allow_shell ON + a trusted key + a pty."""
+    base = make_authorizer(cfg, trust, peer_fingerprint)
+
+    def authorize(name):
+        reason = base(name)
+        if reason:
+            return reason
+        if name == SERVICE_SHELL and not pty_available():
+            return "this host cannot run a shell (needs Linux, macOS or WSL)"
+        return None
+    return authorize
 
 
 def _report_handshake_error(e, trust, name):
@@ -181,7 +224,7 @@ def _resolve_target(target):
 
 
 def make_on_conn(ident, trust, cfg):
-    """Callback for Node.listen: handshake as responder, then hand over to _after_handshake."""
+    """Callback for Node.listen: handshake as responder, then serve ONE service."""
     async def on_conn(conn):
         try:
             keys = await perform_handshake(conn, ident, trust, "responder",
@@ -189,7 +232,16 @@ def make_on_conn(ident, trust, cfg):
         except P2PSSHError as e:
             _report_handshake_error(e, trust, getattr(conn, "peer_name", "?"))
             return
-        await _after_handshake(conn, keys, cfg, "responder")
+        session = SecureSession(conn, keys)
+        print(f"secure channel established (responder) with {keys.peer_fingerprint}")
+        try:
+            name = await serve_service(session, _host_handlers(cfg),
+                                       _host_authorizer(cfg, trust, keys.peer_fingerprint))
+            print(f"'{name}' session finished")
+        except _RUNTIME_ERRORS as e:
+            print(f"session ended: {e}")
+        finally:
+            await session.close()
     return on_conn
 
 
@@ -236,11 +288,10 @@ def cmd_listen(args, cfg):
     return 0
 
 
-def cmd_connect(args, cfg):
-    if not args.target:
-        print("error: usage: connect <peer-name | IP:port>")
-        return 1
-    host, port, label = _resolve_target(args.target)
+def _run_client(cfg, target, service, client_fn):
+    """Dial a peer, handshake, ask for ONE service, run client_fn(session) on it.
+    service=None only proves the secure channel works (used by `connect`)."""
+    host, port, label = _resolve_target(target)
     ident = load_or_create_identity(cfg.key_dir)
     trust = TrustStore(cfg.trust_path)
 
@@ -249,52 +300,74 @@ def cmd_connect(args, cfg):
         try:
             keys = await perform_handshake(conn, ident, trust, "initiator",
                                            cfg.allow_self, confirm=_confirm)
-            await _after_handshake(conn, keys, cfg, "initiator")
         except P2PSSHError as e:
             _report_handshake_error(e, trust, label)
+            await conn.close()
+            return 1
+        session = SecureSession(conn, keys)
+        print(f"secure channel established (initiator) with {keys.peer_fingerprint}")
+        try:
+            if service is not None:
+                await request_service(session, service)
+                return await client_fn(session) or 0
+            return 0
+        except _RUNTIME_ERRORS as e:
+            print(f"error: {e}")
             return 1
         finally:
-            await conn.close()
-        return 0
+            await session.close()
 
     try:
         return asyncio.run(run())
     except KeyboardInterrupt:
         print("\nstopped")
         return 1
-    except P2PSSHError as e:
+    except _RUNTIME_ERRORS as e:
         print(f"error: {e}")
         return 1
 
-def _precheck(args, cfg):
-    """Input checks shared by chat / send / shell (now and after the session exists).
-    Returns an exit code if the input is bad, or None if it is fine."""
-    target = getattr(args, "target", None)
-    if args.command == "shell" and target and not cfg.allow_shell:
-        print("error: remote shell is OFF. Enable with: config set allow_shell true")
+
+def cmd_connect(args, cfg):
+    if not args.target:
+        print("error: usage: connect <peer-name | IP:port>")
         return 1
-    if target:
-        if ":" in target:
-            parse_hostport(target)                      # raises DiscoveryError if bad
-        elif args.command == "shell" and target not in TrustStore(cfg.trust_path).list_peers():
-            print(f"error: '{target}' is not trusted. Use: trust add {target} <pubkey>")
-            return 1
-    path = getattr(args, "path", None)
-    if args.command == "send" and path and not os.path.isfile(path):
-        print(f"error: file not found: {path}")
-        return 1
-    return None
+    return _run_client(cfg, args.target, None, None)
 
 
-def cmd_not_ready(args, cfg):
-    """chat / send / shell: checks input now; the real work is wired in once
-    M3's SecureSession exists. To go live: change set_defaults(func=...) to a command
-    that calls _precheck, then connects like cmd_connect and fills _after_handshake."""
-    bad = _precheck(args, cfg)
-    if bad is not None:
-        return bad
-    print(f"'{args.command}' is not available yet (needs the secure session).")
-    return 2
+def cmd_send(args, cfg):
+    if not args.target or not args.path:
+        print("error: usage: send <peer-name | IP:port> <file>")
+        return 1
+    if not os.path.isfile(args.path):
+        print(f"error: file not found: {args.path}")
+        return 1
+
+    async def client(session):
+        await send_file(session, args.path)
+        print(f"sent {os.path.basename(args.path)}")
+    return _run_client(cfg, args.target, SERVICE_FILE, client)
+
+
+def cmd_shell(args, cfg):
+    if not args.target:
+        print("error: usage: shell <peer-name | IP:port>")
+        return 1
+    if not pty_available():
+        print("error: remote shell needs a Unix terminal: use Linux, macOS or WSL")
+        return 1
+    return _run_client(cfg, args.target, SERVICE_SHELL, run_shell_client)
+
+
+def cmd_chat(args, cfg):
+    if not args.target:
+        print("error: usage: chat <peer-name | IP:port>")
+        return 1
+    run_chat = _load_chat()
+    if run_chat is None:
+        print("'chat' is not available yet (waiting for chat.py).")
+        return 2
+    return _run_client(cfg, args.target, SERVICE_CHAT, run_chat)
+
 
 def build_parser():
     p = argparse.ArgumentParser(prog="p2pssh", description="Peer-to-peer secure communication")
@@ -329,15 +402,18 @@ def build_parser():
     sp.add_argument("target", nargs="?")
     sp.set_defaults(func=cmd_connect)
 
-    for name in ("chat", "shell"):
-        sp = sub.add_parser(name, help="peer name or IP:port (needs handshake)")
-        sp.add_argument("target", nargs="?")
-        sp.set_defaults(func=cmd_not_ready)
-   
-    sp = sub.add_parser("send", help="send a file (needs handshake)")
+    sp = sub.add_parser("chat", help="chat with a peer name or IP:port")
+    sp.add_argument("target", nargs="?")
+    sp.set_defaults(func=cmd_chat)
+
+    sp = sub.add_parser("shell", help="open a shell on a peer (the HOST must allow it)")
+    sp.add_argument("target", nargs="?")
+    sp.set_defaults(func=cmd_shell)
+
+    sp = sub.add_parser("send", help="send a file to a peer name or IP:port")
     sp.add_argument("target", nargs="?")
     sp.add_argument("path", nargs="?")
-    sp.set_defaults(func=cmd_not_ready)
+    sp.set_defaults(func=cmd_send)
     return p
 
 
@@ -345,7 +421,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args, load_config())
-    except (ConfigError, IdentityError, TrustError, DiscoveryError, P2PSSHError) as e:
+    except (ConfigError, IdentityError, TrustError, DiscoveryError, *_RUNTIME_ERRORS) as e:
         print(f"error: {e}")
         return 1
 
