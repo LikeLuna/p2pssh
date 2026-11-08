@@ -166,3 +166,116 @@ async def run_client(send_input, send_resize, output_queue: "asyncio.Queue") -> 
         loop.remove_reader(fd_in)
         loop.remove_signal_handler(signal.SIGWINCH)
         termios.tcsetattr(fd_in, termios.TCSADRAIN, saved)   # always restore terminal
+
+
+
+
+
+# ---------------------------------------------------------------- shell over a SecureSession
+# Inside the "shell" service the two sides exchange tagged records:
+#   client -> host : b"D" + keystrokes          b"R" + rows (2 bytes) + cols (2 bytes)
+#   host -> client : b"O" + terminal output     b"X" + exit code (1 byte), then the host stops
+TAG_IN, TAG_RESIZE, TAG_OUT, TAG_EXIT = b"D", b"R", b"O", b"X"
+CHUNK = 8 * 1024          # well below the session's 16 KiB record limit
+
+
+def pty_available() -> bool:
+    try:
+        _require_pty()
+    except ShellError:
+        return False
+    return True
+
+
+async def serve_shell(session, shell=None) -> int:
+    """HOST side: run a shell in a pty and bridge it to the session. Returns its exit code.
+    If the peer disconnects, the shell is killed (no orphan process)."""
+    out = asyncio.Queue()
+    exit_code = [0]
+
+    def finished(code):
+        exit_code[0] = code
+        out.put_nowait(None)
+
+    server = ShellServer(out.put_nowait, on_exit=finished, shell=shell)
+    server.start()
+
+    async def pump():
+        while True:
+            data = await out.get()
+            if data is None:
+                break
+            for i in range(0, len(data), CHUNK):
+                await session.send(TAG_OUT + data[i:i + CHUNK])
+        await session.send(TAG_EXIT + bytes([exit_code[0] & 0xFF]))
+
+    async def reader():
+        while True:
+            msg = await session.recv()
+            tag, body = msg[:1], msg[1:]
+            if tag == TAG_IN:
+                server.feed(body)
+            elif tag == TAG_RESIZE and len(body) == 4:
+                rows, cols = struct.unpack(">HH", body)
+                server.resize(rows, cols)
+            # any other tag is ignored
+
+    tasks = [asyncio.ensure_future(pump()), asyncio.ensure_future(reader())]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            t.result()                      # re-raise a session error, if any
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        server.close()
+    return exit_code[0]
+
+
+async def run_shell_client(session) -> int:
+    """CLIENT side: connect my terminal to the host's shell. Returns the remote exit code."""
+    _require_pty()
+    out_q = asyncio.Queue()
+    exit_code = [0]
+    pending = set()
+
+    def spawn(coro):
+        task = asyncio.ensure_future(coro)
+        pending.add(task)
+        task.add_done_callback(lambda t: (pending.discard(t), t.cancelled() or t.exception()))
+
+    def send_input(data):
+        for i in range(0, len(data), CHUNK):
+            spawn(session.send(TAG_IN + data[i:i + CHUNK]))
+
+    def send_resize(rows, cols):
+        spawn(session.send(TAG_RESIZE + struct.pack(">HH", min(rows, 65535), min(cols, 65535))))
+
+    async def receiver():
+        try:
+            while True:
+                msg = await session.recv()
+                tag, body = msg[:1], msg[1:]
+                if tag == TAG_OUT:
+                    out_q.put_nowait(body)
+                elif tag == TAG_EXIT:
+                    exit_code[0] = body[0] if body else 0
+                    return
+        finally:
+            out_q.put_nowait(None)          # tell run_client the remote side is gone
+
+    recv_task = asyncio.ensure_future(receiver())
+    try:
+        await run_client(send_input, send_resize, out_q)
+    finally:
+        failure = None
+        if recv_task.done() and not recv_task.cancelled():
+            failure = recv_task.exception()
+        recv_task.cancel()
+        for t in list(pending):
+            t.cancel()
+        await asyncio.gather(recv_task, *pending, return_exceptions=True)
+    if failure is not None:
+        raise failure
+    return exit_code[0]

@@ -46,3 +46,4 @@ async def test_bad_resize_ignored():
     srv.resize(0, 0)
     srv.resize(-5, 99999)
     srv.close()
+
