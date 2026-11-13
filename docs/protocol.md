@@ -213,6 +213,40 @@ Run first against `tests/stubs.py` (in-memory queues), then over real TCP with B
 | 3 | Domain separation in signed data | **Adopted.** Signed bytes are `PREFIX || H` with the 16-byte prefixes in section 3.2. Not sent on the wire |
 | 4 | Self-connect | **Rejected by default.** Allowed only with `allow_self=True` / `--allow-self`; no other check is skipped |
 
+## 11. Application layer (services)
+
+After the handshake, every connection carries **exactly one service**. There is no multiplexing, no channel ids and no type byte: each secure record (section 8, `SecureSession.send/recv`) is one application message. The records below are plain bytes inside the encrypted session, so they are authenticated and confidential like everything else.
+
+### 11.1 Choosing the service
+
+```
+client -> host   b"svc:" + name          name in {chat, shell, file}; whole record at most 64 bytes
+host -> client   b"ok"                   service accepted, the service protocol starts with the next record
+             or  b"denied:" + reason     reason is short text (at most 120 bytes); the host then closes
+```
+
+| Denial reason | When |
+|---|---|
+| `bad request` | Record does not start with `svc:`, name is empty/not UTF-8/too long |
+| `unknown service` | Name is not `chat`, `shell` or `file` |
+| `service not available` | The host has no handler for that service |
+| `remote shell is disabled on this host` | `shell` requested, `allow_shell` is off in the host config |
+| `peer is not trusted for shell access` | `shell` requested by a key that is not TRUSTED in the host's trust store |
+
+Rules: the client sends the request first and waits for the reply; the host answers exactly once. After `denied:` nothing else is sent and both sides close. A client must treat any reply other than `ok` or `denied:<reason>` as an error and close. The reason text is shown to the user only after removing control characters (`clean_text`). Authorization is decided by the **host** from its own config and trust store, never from anything the client claims.
+
+### 11.2 `chat`
+
+- One record = one chat message = UTF-8 text, at most **4096 bytes**. No other framing.
+- Receiver ignores (with a local notice, no disconnect): empty records, records over 4096 bytes, records that are not valid UTF-8.
+- Receiver removes terminal escape sequences (CSI, OSC, other ESC sequences), control characters and invisible bidi/format characters before printing, and turns CR/LF/TAB into spaces, so a message can never move the cursor, change the terminal, or fake a new line.
+- A sender refuses (does not silently cut) a line over 4096 bytes.
+- Leaving = closing the session. `/quit`, `/exit` or end of input on the local side ends the chat; the peer sees "left the chat".
+
+### 11.3 `shell` and `file`
+
+`shell` uses tagged records `D` (input), `R` (resize), `O` (output), `X` (exit code). `file` uses one JSON metadata record followed by data chunks; filenames are validated and the size limit is 100 MiB. See `p2pssh/shell.py` and `p2pssh/files.py` for the exact layouts.
+
 ## Appendix A. Reference computation (for test vectors)
 
 ```python
