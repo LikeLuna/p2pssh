@@ -233,6 +233,7 @@ def make_on_conn(ident, trust, cfg):
             _report_handshake_error(e, trust, getattr(conn, "peer_name", "?"))
             return
         session = SecureSession(conn, keys)
+        session.start_keepalive()
         print(f"secure channel established (responder) with {keys.peer_fingerprint}")
         try:
             name = await serve_service(session, _host_handlers(cfg),
@@ -305,6 +306,7 @@ def _run_client(cfg, target, service, client_fn):
             await conn.close()
             return 1
         session = SecureSession(conn, keys)
+        session.start_keepalive()
         print(f"secure channel established (initiator) with {keys.peer_fingerprint}")
         try:
             if service is not None:
