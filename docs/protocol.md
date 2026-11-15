@@ -247,6 +247,17 @@ Rules: the client sends the request first and waits for the reply; the host answ
 
 `shell` uses tagged records `D` (input), `R` (resize), `O` (output), `X` (exit code). `file` uses one JSON metadata record followed by data chunks; filenames are validated and the size limit is 100 MiB. See `p2pssh/shell.py` and `p2pssh/files.py` for the exact layouts.
 
+## 12. Keepalive
+
+Goal: notice a peer that vanished (laptop closed, cable pulled) without waiting for TCP, which can take minutes.
+
+- A **ping is an empty secure record**: `SecureSession.send(b"")`. It is encrypted and authenticated like any record, so an attacker cannot fake one, and it uses the normal record counter.
+- `SecureSession.recv()` swallows pings: the application never sees an empty record, and no service may use an empty record as a message.
+- After the handshake each side calls `session.start_keepalive()`. Every `PING_INTERVAL` (15 s) without sending anything, it sends a ping.
+- If a task is waiting in `recv()` and nothing at all (ping or data) has arrived for `IDLE_TIMEOUT` (45 s), the session is closed and the waiting `recv()` raises `SessionError`.
+- The idle check runs only while somebody waits in `recv()`. A side that is busy sending (for example a long file upload) is never closed as idle.
+- Pings are not sent during the handshake (it has its own 10 s deadline, `HANDSHAKE_TIMEOUT`).
+
 ## Appendix A. Reference computation (for test vectors)
 
 ```python
