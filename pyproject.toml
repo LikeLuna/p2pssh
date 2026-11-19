@@ -1,15 +1,16 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "p2pssh"
 version = "0.1.0"
+description = "Peer-to-peer secure chat, file transfer and shell. No server."
 requires-python = ">=3.10"
 dependencies = ["cryptography", "zeroconf", "rich"]
 
 [project.scripts]
-p2pssh = "p2pssh.cli:main"
+p2pssh = "p2pssh.__main__:main"
 
 [tool.setuptools]
 packages = ["p2pssh"]
